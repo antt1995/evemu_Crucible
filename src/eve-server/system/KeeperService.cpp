@@ -45,46 +45,29 @@
 #include "PyServiceCD.h"
 #include "system/KeeperService.h"
 #include "system/SystemManager.h"
+#include "dungeon/DungeonDB.h"
 
-class KeeperBound
-: public PyBoundObject
+KeeperBound::KeeperBound(PyServiceMgr *mgr, SystemDB *db)
+: PyBoundObject(mgr),
+m_db(db),
+m_dispatch(new Dispatcher(this))
 {
-public:
-    PyCallable_Make_Dispatcher(KeeperBound)
+    _SetCallDispatcher(m_dispatch);
 
-    KeeperBound(PyServiceMgr *mgr, SystemDB *db)
-    : PyBoundObject(mgr),
-    m_db(db),
-    m_dispatch(new Dispatcher(this))
-    {
-        _SetCallDispatcher(m_dispatch);
+    m_strBoundObjectName = "KeeperBound";
 
-        m_strBoundObjectName = "KeeperBound";
+    PyCallable_REG_CALL(KeeperBound, EditDungeon);
+    PyCallable_REG_CALL(KeeperBound, PlayDungeon);
+    PyCallable_REG_CALL(KeeperBound, Reset);
+    PyCallable_REG_CALL(KeeperBound, GotoRoom); //(int room)
+    PyCallable_REG_CALL(KeeperBound, GetCurrentlyEditedRoomID);
+    PyCallable_REG_CALL(KeeperBound, GetRoomObjects);
+    PyCallable_REG_CALL(KeeperBound, GetRoomGroups);
+    PyCallable_REG_CALL(KeeperBound, ObjectSelection);
+    PyCallable_REG_CALL(KeeperBound, BatchStart);
+    PyCallable_REG_CALL(KeeperBound, BatchEnd);
 
-        PyCallable_REG_CALL(KeeperBound, EditDungeon);
-        PyCallable_REG_CALL(KeeperBound, PlayDungeon);
-        PyCallable_REG_CALL(KeeperBound, Reset);
-        PyCallable_REG_CALL(KeeperBound, GotoRoom); //(int room)
-        PyCallable_REG_CALL(KeeperBound, GetCurrentlyEditedRoomID);
-
-    }
-    virtual ~KeeperBound() { delete m_dispatch; }
-    virtual void Release() {
-        //I hate this statement
-        delete this;
-    }
-
-    PyCallable_DECL_CALL(EditDungeon);
-    PyCallable_DECL_CALL(PlayDungeon);
-    PyCallable_DECL_CALL(Reset);
-    PyCallable_DECL_CALL(GotoRoom);
-    PyCallable_DECL_CALL(GetCurrentlyEditedRoomID);
-
-protected:
-    SystemDB *const m_db;
-    Dispatcher *const m_dispatch;   //we own this
-};
-
+}
 
 PyCallable_Make_InnerDispatcher(KeeperService)
 
@@ -173,15 +156,117 @@ PyResult KeeperService::Handle_ActivateAccelerationGate(PyCallArgs &call) {
     return new PyLong(Win32TimeNow());
 }
 
-
-
 PyResult KeeperBound::Handle_EditDungeon(PyCallArgs &call)
 {
     //ed.EditDungeon(dungeonID, roomID=roomID)
     _log(DUNG__CALL,  "KeeperBound::Handle_EditDungeon  size: %li", call.tuple->size());
     call.Dump(DUNG__CALL_DUMP);
 
+    Call_SingleIntegerArg args;
+    if (!args.Decode(&call.tuple)) {
+        codelog(SERVICE__ERROR, "%s: Failed to decode arguments.", GetName());
+        return nullptr;
+    }
+
+    /*
+    Tasks to accomplish
+    1. Set current position as 0,0,0 in room
+    2. Load all room objects from dunRoomObjects into a vector
+    3. Spawn all room objects using their relative positions from 0,0,0
+    */
+
+    Client *pClient(call.client);
+
+    GPoint roomPos = pClient->GetShipSE()->GetPosition();
+
+    pClient->GetSession()->SetFloat("editor_room_x", roomPos.x);
+    pClient->GetSession()->SetFloat("editor_room_y", roomPos.y);
+    pClient->GetSession()->SetFloat("editor_room_z", roomPos.z);
+
+    pClient->GetSession()->SetInt("editor_bind_id", bindID());
+
+    std::vector<Dungeon::RoomObject> objects;
+    DungeonDB::GetRoomObjects(call.byname["roomID"]->AsInt()->value(), objects);
+
+    // Spawn the items in the object list
+    for (auto cur : objects) {
+        GPoint objPos;
+        objPos.x = roomPos.x + cur.x;
+        objPos.y = roomPos.y + cur.y;
+        objPos.z = roomPos.z + cur.z;
+
+        ItemData dData(cur.typeID, 1/*EVE SYSTEM*/, pClient->GetLocationID(), flagNone, "", objPos);
+        InventoryItemRef iRef = InventoryItem::SpawnItem(sItemFactory.GetNextTempID(), dData);
+        if (iRef.get() == nullptr) // Failed to spawn the item
+            continue;
+        DungeonEditSE* oSE;
+        oSE = new DungeonEditSE(iRef, *(m_manager), pClient->SystemMgr(), cur);
+        m_roomObjects.push_back(oSE);
+        pClient->SystemMgr()->AddEntity(oSE, false);
+        // Set the radius from the data structure
+        oSE->DestinyMgr()->SetRadius(cur.radius, true);
+    }
+
+    // Send notification to client to update UI
+    PyList* posList = new PyList();
+        posList->AddItem(new PyFloat(roomPos.x));
+        posList->AddItem(new PyFloat(roomPos.y));
+        posList->AddItem(new PyFloat(roomPos.z));
+
+    PyTuple* payload = new PyTuple(3);
+    payload->SetItem(0, new PyInt(args.arg)); //dungeonID
+    payload->SetItem(1, new PyInt(call.byname["roomID"]->AsInt()->value())); //roomID
+    payload->SetItem(2, posList); //roomPos
+
+    pClient->SendNotification("OnDungeonEdit", "charid", payload, false);
+
+    // update local variables with what we're editing right now
+    this->m_currentRoom = call.byname["roomID"]->AsInt()->value();
+    this->m_currentDungeon = args.arg;
+
     return nullptr;
+}
+
+PyResult KeeperBound::Handle_GetRoomObjects(PyCallArgs &call)
+{
+    _log(DUNG__CALL,  "KeeperBound:::Handle_GetRoomObjects  size: %li", call.tuple->size());
+    call.Dump(DUNG__CALL_DUMP);
+
+    Call_SingleIntegerArg args;
+    if (!args.Decode(&call.tuple))
+    {
+        _log(SERVICE__ERROR, "%s: Failed to decode arguments.", GetName());
+        return nullptr;
+    }
+
+    DBRowDescriptor *header = new DBRowDescriptor();
+    header->AddColumn("objectID", DBTYPE_I4);
+    header->AddColumn("groupID", DBTYPE_I4);
+
+    CRowSet *rowset = new CRowSet(&header);
+
+    for (auto cur : m_roomObjects) {
+        PyPackedRow *newRow = rowset->NewRow();
+        newRow->SetField("objectID", new PyInt(cur->GetID()));
+        newRow->SetField("groupID", new PyInt(cur->GetData().groupID));
+    }
+
+    return rowset;
+}
+
+PyResult KeeperBound::Handle_GetRoomGroups( PyCallArgs& call )
+{
+    _log(DUNG__CALL,  "KeeperBound::Handle_GetRoomGroups  size: %li", call.tuple->size());
+    call.Dump(DUNG__CALL_DUMP);
+
+    Call_SingleIntegerArg args;
+    if (!args.Decode(&call.tuple))
+    {
+        _log(SERVICE__ERROR, "%s: Failed to decode arguments.", GetName());
+        return nullptr;
+    }
+
+    return DungeonDB::GetRoomGroups(args.arg);
 }
 
 PyResult KeeperBound::Handle_PlayDungeon(PyCallArgs &call)
@@ -197,6 +282,18 @@ PyResult KeeperBound::Handle_Reset(PyCallArgs &call)
 {
     _log(DUNG__CALL,  "KeeperBound::Handle_Reset  size: %li", call.tuple->size());
     call.Dump(DUNG__CALL_DUMP);
+
+    if (this->m_roomObjects.size())
+        // reset means unload everything
+        for (auto cur : m_roomObjects)
+            cur->Delete();
+
+    // empty the list
+    this->m_roomObjects.clear();
+
+    // make sure state is sent, this should call the correct flow in the client to update the item
+    call.client->SetStateSent(false);
+    call.client->GetShipSE()->DestinyMgr()->SendSetState();
 
     return nullptr;
 }
@@ -218,3 +315,71 @@ PyResult KeeperBound::Handle_GetCurrentlyEditedRoomID(PyCallArgs &call)
     return nullptr;
 }
 
+PyResult KeeperBound::Handle_ObjectSelection(PyCallArgs &call)
+{
+    _log(DUNG__CALL,  "KeeperBound::Handle_ObjectSelection  size: %li", call.tuple->size());
+    call.Dump(DUNG__CALL_DUMP);
+
+    Call_SingleIntList args;
+    if (!args.Decode(&call.tuple))
+    {
+        _log(SERVICE__ERROR, "%s: Failed to decode arguments.", GetName());
+        return nullptr;
+    }
+
+    this->m_selectedObjects = args.ints;
+
+    // a copy of the list has to be returned, otherwise the client won't know what they're selecting
+    // i feel like this would be handled client-side if the jessica package was loaded
+    // but i have no real idea... so the server it is
+    PyTuple* data = args.Encode();
+
+    PyRep* result = data->GetItem(0);
+
+    PySafeDecRef(data);
+
+    return result;
+}
+
+PyResult KeeperBound::Handle_BatchStart(PyCallArgs &call)
+{
+    // nothing needed for now
+    // might be used by CCP to lock selected items or something
+    return nullptr;
+}
+
+PyResult KeeperBound::Handle_BatchEnd(PyCallArgs &call)
+{
+    // make sure state is sent, this should call the correct flow in the client to update the item
+    call.client->SetStateSent(false);
+    call.client->GetShipSE()->DestinyMgr()->SendSetState();
+
+    // send new set state to the client
+    return nullptr;
+}
+
+void KeeperBound::RemoveRoomObject(uint32 itemID)
+{
+    uint32 objectID = 0;
+    for (std::vector <DungeonEditSE*> ::iterator cur = m_roomObjects.begin(); cur != m_roomObjects.end(); cur++) {
+        if ((*cur)->GetID() == itemID) {
+            objectID = (*cur)->GetData().objectID;
+            (*cur)->Delete();
+            SafeDelete(*cur);
+            m_roomObjects.erase(cur);
+            break;
+        }
+    }
+
+    DungeonDB::DeleteObject(objectID);
+}
+
+DungeonEditSE* KeeperBound::GetRoomObject(uint32 itemID)
+{
+    for (std::vector <DungeonEditSE*> ::iterator cur = m_roomObjects.begin(); cur != m_roomObjects.end(); cur++) {
+        if ((*cur)->GetID() == itemID)
+            return (*cur);
+    }
+
+    return nullptr;
+}
