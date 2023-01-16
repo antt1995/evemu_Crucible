@@ -35,6 +35,7 @@ db-port: 3306
 db-user: evemu
 log-level: Info
 migrations-dir: /src/sql/migrations
+dungeons-dir: /src/sql/dungeons
 EOF
 
 echo "Running EVEDBTool..."
@@ -51,3 +52,6 @@ then
     done
     /src/sql/evedbtool seed
 fi
+
+echo "Loading all dungeons using EVEDBTool..."
+/src/sql/evedbtool dungeon apply
